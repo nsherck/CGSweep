@@ -40,6 +40,9 @@ def GaussianBasisLSQ(knots, rcut, rcutinner, ng, nostage, N, BoundSetting, U_max
     ShowFigures = ShowFigures
     SaveToFile = SaveToFile
     SaveFileName = SaveFileName
+    
+    MatchIntPot = True
+    MatchSecondVir = False
 
     if SaveToFile: 
         try:
@@ -57,19 +60,69 @@ def GaussianBasisLSQ(knots, rcut, rcutinner, ng, nostage, N, BoundSetting, U_max
         exp = log(n, 10)
         exp = floor(exp)
         return 10**exp
-
-    def obj(x,w,rs,u_spline,TailCorrection,rcut,TailWeight): 
+    
+    def getIntPairPotSpline(knots, rcut, MaxPairEnekBT = 20, kB = 1,TempSet = 1):
+        rs_temp = np.linspace(0,rcut,1E4)
+        rssq = np.multiply(rs_temp,rs_temp)
+        myspline = spline.Spline(rcut,knots)
+        u_spline_temp = []
+        du_spline_temp = []
+        
+        for r in rs_temp:
+            u_spline_temp.append(myspline.Val(r))
+            du_spline_temp.append(myspline.DVal(r)) 
+        u_spline_temp = np.array(u_spline_temp)
+        #get the maximum pair energy
+        MaxPairEne = kB * TempSet * MaxPairEnekBT
+        #indices where energy is greater
+        ind = np.where(u_spline_temp> MaxPairEne)[0]
+        if len(ind):
+            #find the first index where energy is valid
+            i = ind[-1] + 1
+            #do a linear extrapolation in the hard core region
+            u_spline_temp[:i] = (rs[i] - rs[:i]) * -du_spline_temp[i] + u_spline_temp[i]
+            
+        integrand_pot = np.multiply(u_spline_temp,rssq)
+        integrand_virial = 4*np.pi*np.multiply(rssq,(1-np.exp(-u_spline_temp)))
+        int_pot = simps(integrand_pot,rs_temp)
+        int_virial = simps(integrand_virial,rs_temp)  
+        
+        return int_pot, int_virial
+    
+    def getIntPairPotGauss(x,n,rcut):
+        rs_temp = np.linspace(0,rcut,1E4)
+        rssq = np.multiply(rs_temp,rs_temp)    
+        u_gauss_temp = getUgauss(x,rs_temp,n)
+        integrand_pot = np.multiply(u_gauss_temp,rssq)
+        integrand_virial = 4*np.pi*np.multiply(rssq,(1-np.exp(-u_gauss_temp)))
+        int_pot = simps(integrand_pot,rs_temp)
+        int_virial = simps(integrand_virial,rs_temp)   
+        
+        return int_pot, int_virial
+    
+    def obj(x,w,rs,u_spline,TailCorrection,rcut,TailWeight,MatchIntPot,MatchSecondVir,int_pot_s, int_virial_s): 
         """Calculate Boltzmann weighted residuals"""
         n = int(len(x)/2) #number of Gaussians
         u_gauss = getUgauss(x,rs,n)
+        if MatchIntPot or MatchSecondVir:
+            int_pot_g, int_virial_g = getIntPairPotGauss(x,n,rcut)     
+        
+        obj_out = (w*(u_gauss-u_spline))
+               
         if TailCorrection:
             w_tail = TailWeight
             rcut_temp = np.zeros(1)
             rcut_temp[0] = rcut
             tail_value = np.abs(getUgauss(x,rcut_temp,n)-0)
-            return w*(u_gauss-u_spline)+w_tail*(tail_value)
-        else:
-            return w*(u_gauss-u_spline)
+            obj_out = np.append(obj_out,w_tail*(tail_value))
+        if MatchIntPot:
+            w_IntPot = 10.
+            obj_out = np.append(obj_out,w_IntPot*(int_pot_g-int_pot_s))
+        if MatchSecondVir:
+            w_SecondVir = 10.
+            obj_out = np.append(obj_out,w_SecondVir*(int_virial_g-int_virial_s))
+
+        return obj_out 
 
     def getUgauss(x,rs,n):
         u_gauss = np.zeros(len(rs))
@@ -199,13 +252,22 @@ def GaussianBasisLSQ(knots, rcut, rcutinner, ng, nostage, N, BoundSetting, U_max
 
             else:
                 x0 = [p for p in xopt]
-                x0.extend([0,kappa_lowerbound])
+                x0.extend([0,3*kappa_lowerbound])
                 sys.stdout.write('\nInitial guess: {}'.format(x0))
                 sys.stdout.write('\nParameters from optimizing {} Gaussians:'.format(i+1))
                 logout.write('\nParameters from optimizing {} Gaussians:\n'.format(i+1))
                 logout.write('\nInitial guess: {}\n'.format(x0))
+            
+            int_pot_s = 0.
+            int_virial_s = 0.
+            if MatchIntPot or MatchSecondVir:
+                MatchIntPot = False
+                gauss_temp = least_squares(obj,x0, args = (w,rs,u_spline, TailCorrection, rcut,TailWeight,MatchIntPot, MatchSecondVir,int_pot_s, int_virial_s),bounds=bounds)
+                int_pot_s, int_virial_s = getIntPairPotSpline(knots, rcut, MaxPairEnekBT = 20, kB = 1,TempSet = 1)
+                MatchIntPot = True
+                x0 = gauss_temp.x # get initial guess for parameters
                 
-            gauss = least_squares(obj,x0, args = (w,rs,u_spline, TailCorrection, rcut,TailWeight),bounds=bounds)
+            gauss = least_squares(obj,x0, args = (w,rs,u_spline, TailCorrection, rcut,TailWeight,MatchIntPot, MatchSecondVir,int_pot_s, int_virial_s),bounds=bounds)
             xopt = gauss.x
             param_list.append(xopt)
             sys.stdout.write('\n{}'.format(xopt))
@@ -226,10 +288,16 @@ def GaussianBasisLSQ(knots, rcut, rcutinner, ng, nostage, N, BoundSetting, U_max
             x0 = [float(i) for i in re.split(' |,',args.x0) if len(i)>0]
             if len(x0) != 2*n:
                 raise Exception('Wrong number of initial values')
+                
+        int_pot_s = 0.
+        int_virial_s = 0.
+        if MatchIntPot or MatchSecondVir:
+            int_pot_s, int_virial_s = getIntPairPotSpline(knots, rcut, MaxPairEnekBT = 20, kB = 1,TempSet = 1)
+                
         bounds = getBounds(n)
         sys.stdout.write('\nInitial guess:')
         sys.stdout.write('\n{}'.format(x0))
-        gauss = least_squares(obj,x0, args = (w,rs,u_spline, TailCorrection, rcut,TailWeight),bounds=bounds)
+        gauss = least_squares(obj,x0, args = (w,rs,u_spline, TailCorrection, rcut,TailWeight,MatchIntPot, MatchSecondVir,int_pot_s, int_virial_s),bounds=bounds)
         xopt = gauss.x
         sys.stdout.write('\nParameters from optimizing {} Gaussians:'.format(n))
         sys.stdout.write('\n{}'.format(xopt))
@@ -275,7 +343,7 @@ def GaussianBasisLSQ(knots, rcut, rcutinner, ng, nostage, N, BoundSetting, U_max
     logout.write('TailCorrection: {}'.format(TailCorrection))
     logout.write('\nTail Weight: {}'.format(TailWeight))
     logout.write('\nTailCorrection constrains the Gaussians to sum to zero at the cutoff.')
-    logout.close()        
+            
     np.savetxt('slope.data', zip(gauss_list[1:],derLSQObj))        
 
     u_gauss = getUgauss(xopt,rs,n)
@@ -291,7 +359,22 @@ def GaussianBasisLSQ(knots, rcut, rcutinner, ng, nostage, N, BoundSetting, U_max
     plt.savefig('GaussFit.pdf')
     if ShowFigures:
         plt.show()
-
+        
+    # Get the integral of the pair potential and the second virial coeff for gaussian
+    rs_temp = np.linspace(0,rcut,1E6)
+    rssq = np.multiply(rs_temp,rs_temp)
+    u_gauss_temp = getUgauss(param_list[index_opt],rs_temp,gauss_list[index_opt])
+    integrand_pot = np.multiply(u_gauss_temp,rssq)
+    integrand_virial = 4*np.pi*np.multiply(rssq,(1-np.exp(-u_gauss_temp)))
+    int_pot = simps(integrand_pot,rs_temp)
+    int_virial = simps(integrand_virial,rs_temp)
+    
+    logout.write('\n The integral of the pair potential (Gauss):\n')
+    logout.write('{}'.format(int_pot))
+    logout.write('\n The second virial coefficient (Gauss):\n')
+    logout.write('{}'.format(int_virial))
+    logout.close()
+    
     np.savetxt('cost.data', zip(gauss_list,cost_list))
     np.savetxt('u_gauss.data', np.transpose(np.asarray(u_gauss_list)))                                                                  
 
